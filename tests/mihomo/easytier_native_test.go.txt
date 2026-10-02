@@ -1,0 +1,198 @@
+package outbound
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net"
+	"net/netip"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	et "github.com/easytier/easytier-go"
+	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/resolver"
+	C "github.com/metacubex/mihomo/constant"
+	D "github.com/miekg/dns"
+)
+
+type nativeWrappedConn struct{ net.Conn }
+type nativeWrappedPacket struct{ net.PacketConn }
+type nativeDialer struct {
+	dials, packets atomic.Int64
+	reject         bool
+}
+
+func (d *nativeDialer) DialContext(ctx context.Context, n, a string) (net.Conn, error) {
+	d.dials.Add(1)
+	if d.reject {
+		return nil, errors.New("host denied")
+	}
+	c, e := (&net.Dialer{}).DialContext(ctx, n, a)
+	if e != nil {
+		return nil, e
+	}
+	return nativeWrappedConn{c}, nil
+}
+func (d *nativeDialer) ListenPacket(ctx context.Context, n, a string, _ netip.AddrPort) (net.PacketConn, error) {
+	d.packets.Add(1)
+	p, e := (&net.ListenConfig{}).ListenPacket(ctx, n, a)
+	if e != nil {
+		return nil, e
+	}
+	return nativeWrappedPacket{p}, nil
+}
+
+type nativeResolver struct {
+	resolver.Resolver
+	calls atomic.Int64
+}
+
+func (r *nativeResolver) Invalid() bool { return true }
+func (r *nativeResolver) LookupIP(ctx context.Context, h string) ([]netip.Addr, error) {
+	r.calls.Add(1)
+	if h != "native.invalid" {
+		return nil, errors.New("unexpected host DNS")
+	}
+	return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+}
+func (r *nativeResolver) LookupIPv4(ctx context.Context, h string) ([]netip.Addr, error) {
+	return r.LookupIP(ctx, h)
+}
+func TestNativeEmbeddedOutbound(t *testing.T) {
+	// This process also imports Mihomo's upstream EasyTier WASM host descriptors.
+	// Successful init proves that the two protobuf registries coexist.
+	r := new(nativeResolver)
+	saved := resolver.ProxyServerHostResolver
+	resolver.ProxyServerHostResolver = r
+	defer func() { resolver.ProxyServerHostResolver = saved }()
+	l, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	server, e := et.New(et.Config{NetworkName: "native", NetworkSecret: "s", Hostname: "remote", IPv4: netip.MustParsePrefix("10.88.0.1/24"), Listeners: []string{"tcp://" + addr}, Encryption: et.Noise})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer server.Close()
+	if e = server.Start(); e != nil {
+		t.Fatal(e)
+	}
+	tcp, e := server.Listen("tcp", ":8080")
+	if e != nil {
+		t.Fatal(e)
+	}
+	go func() {
+		for {
+			c, e := tcp.Accept()
+			if e != nil {
+				return
+			}
+			go func() { defer c.Close(); io.Copy(c, c) }()
+		}
+	}()
+	udp, e := server.ListenPacket("udp", ":8080")
+	if e != nil {
+		t.Fatal(e)
+	}
+	go func() {
+		b := make([]byte, 2048)
+		for {
+			n, a, e := udp.ReadFrom(b)
+			if e != nil {
+				return
+			}
+			udp.WriteTo(b[:n], a)
+		}
+	}()
+	d := new(nativeDialer)
+	_, port, _ := net.SplitHostPort(addr)
+	out, e := NewEasyTierNative(EasyTierNativeOption{Name: "native-a", NetworkName: "native", NetworkSecret: "s", Hostname: "client", IPv4: "10.88.0.2/24", Peers: []string{"tcp://native.invalid:" + port}, UDPListen: "127.0.0.1:0", Secure: true, BasicOption: BasicOption{DialerForAPI: d}})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer out.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for {
+		if _, e = out.server.LookupHost(ctx, "remote.et.net"); e == nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	m := &C.Metadata{Host: "remote.et.net", DstPort: 8080}
+	c, e := out.DialContext(ctx, m)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(time.Second))
+	c.Write([]byte("tcp"))
+	b := make([]byte, 3)
+	if _, e = io.ReadFull(c, b); e != nil || string(b) != "tcp" {
+		t.Fatalf("%s %v", b, e)
+	}
+	pc, e := out.ListenPacketContext(ctx, m)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer pc.Close()
+	pc.SetDeadline(time.Now().Add(time.Second))
+	pc.WriteTo([]byte("udp"), net.UDPAddrFromAddrPort(netip.AddrPortFrom(m.DstIP, m.DstPort)))
+	if _, _, e = pc.ReadFrom(b); e != nil || string(b) != "udp" {
+		t.Fatalf("%s %v", b, e)
+	}
+	q := new(D.Msg)
+	q.SetQuestion("remote.et.net.", D.TypeA)
+	reply, e := (nativeEasyTierDNS{out}).ExchangeContext(ctx, q)
+	if e != nil || len(reply.Answer) != 1 {
+		t.Fatalf("%v %v", reply, e)
+	}
+	other, e := NewEasyTierNative(EasyTierNativeOption{Name: "native-b", NetworkName: "isolated", Hostname: "client", IPv4: "10.88.0.2/24"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer other.Close()
+	if _, e = other.server.LookupHost(ctx, "remote"); !errors.Is(e, et.ErrNameNotFound) {
+		t.Fatal("instance leakage", e)
+	}
+	cancelled, stop := context.WithCancel(ctx)
+	stop()
+	if _, e = out.DialContext(cancelled, m); !errors.Is(e, context.Canceled) {
+		t.Fatal(e)
+	}
+	if d.dials.Load() == 0 || d.packets.Load() != 1 || r.calls.Load() == 0 {
+		t.Fatalf("hooks not used: %d %d %d", d.dials.Load(), d.packets.Load(), r.calls.Load())
+	}
+	if _, e = (mihomoNetwork{d}).Listen(ctx, "tcp", "127.0.0.1:0"); e == nil {
+		t.Fatal("custom dialer listener silently bypassed")
+	}
+	direct := mihomoNetwork{dialer.NewDialer()}
+	dl, e := direct.Listen(ctx, "tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	dl.Close()
+	out.Close()
+	out.Close()
+	if _, e = out.DialContext(ctx, m); !errors.Is(e, et.ErrClosed) {
+		t.Fatal(e)
+	}
+	if e = other.server.Up(ctx); e != nil {
+		t.Fatal("closing one stopped another", e)
+	}
+
+}
+func TestNativeHostErrors(t *testing.T) {
+	h := mihomoNetwork{&nativeDialer{reject: true}}
+	if _, e := h.DialContext(context.Background(), "tcp", "127.0.0.1:1"); e == nil {
+		t.Fatal("host error ignored")
+	}
+}

@@ -1,0 +1,14 @@
+package adapter
+
+import "testing"
+
+func TestNativeConfig(t *testing.T) {
+	p, e := ParseProxy(map[string]any{"name": "native-parser", "type": "easytier-native", "network-name": "test", "ipv4": "10.90.0.1/24", "hostname": "parser"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer p.Close()
+	if !p.SupportUDP() {
+		t.Fatal("UDP disabled")
+	}
+}

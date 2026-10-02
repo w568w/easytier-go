@@ -1,0 +1,74 @@
+syntax = "proto3";
+package easytier_go.common;
+option go_package = "github.com/easytier/easytier-go/internal/peerpb";
+import "etg_error.proto";
+message RpcDescriptor{
+  string domain_name = 1;
+  string proto_name = 2;
+  string service_name = 3;
+  uint32 method_index = 4;
+}
+message RpcRequest{
+  RpcDescriptor descriptor = 1;
+  bytes request = 2;
+  int32 timeout_ms = 3;
+}
+message RpcResponse{
+  bytes response = 1;
+  easytier_go.error.Error error = 2;
+  uint64 runtime_us = 3;
+}
+enum CompressionAlgoPb{
+  Invalid = 0;
+  None = 1;
+  Zstd = 2;
+}
+message RpcCompressionInfo{
+  CompressionAlgoPb algo = 1;
+  CompressionAlgoPb accepted_algo = 2;
+}
+message RpcPacket{
+  uint32 from_peer = 1;
+  uint32 to_peer = 2;
+  int64 transaction_id = 3;
+  RpcDescriptor descriptor = 4;
+  bytes body = 5;
+  bool is_request = 6;
+  uint32 total_pieces = 7;
+  uint32 piece_idx = 8;
+  int32 trace_id = 9;
+  RpcCompressionInfo compression_info = 10;
+}
+message Void{
+}
+enum NatType{
+  Unknown = 0;
+  OpenInternet = 1;
+  NoPAT = 2;
+  FullCone = 3;
+  Restricted = 4;
+  PortRestricted = 5;
+  Symmetric = 6;
+  SymUdpFirewall = 7;
+  SymmetricEasyInc = 8;
+  SymmetricEasyDec = 9;
+}
+message Ipv4Addr{
+  uint32 addr = 1;
+}
+message SocketAddr{
+  oneof ip{
+    Ipv4Addr ipv4 = 1;
+  }
+  uint32 port = 3;
+}
+message PeerFeatureFlag{
+  bool support_conn_list_sync = 5;
+  bool disable_p2p = 10;
+}
+message UUID{
+  uint32 part1 = 1;
+  uint32 part2 = 2;
+  uint32 part3 = 3;
+  uint32 part4 = 4;
+}

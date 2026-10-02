@@ -1,0 +1,11 @@
+--- a/adapter/parser.go
++++ b/adapter/parser.go
+@@ -219,1 +219,8 @@
++	case "easytier-native":
++		nativeOption := &outbound.EasyTierNativeOption{BasicOption: basicOption}
++		err = decoder.Decode(mapping, nativeOption)
++		if err != nil {
++			break
++		}
++		proxy, err = outbound.NewEasyTierNative(*nativeOption)
+ 	case "easytier":

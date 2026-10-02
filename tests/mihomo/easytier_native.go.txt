@@ -1,0 +1,194 @@
+package outbound
+
+import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"sync"
+
+	et "github.com/easytier/easytier-go"
+	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/resolver"
+	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/dns"
+	"github.com/metacubex/mihomo/log"
+	D "github.com/miekg/dns"
+)
+
+type mihomoNetwork struct{ dialer C.Dialer }
+
+func (h mihomoNetwork) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return h.dialer.DialContext(ctx, network, address)
+}
+func (h mihomoNetwork) ListenPacket(ctx context.Context, network, address string) (net.PacketConn, error) {
+	return h.dialer.ListenPacket(ctx, network, address, netip.AddrPort{})
+}
+func (h mihomoNetwork) Listen(ctx context.Context, network, address string) (net.Listener, error) {
+	d, ok := h.dialer.(dialer.Dialer)
+	if !ok {
+		return nil, errors.New("easytier-native: TCP listeners require a direct Mihomo dialer")
+	}
+	return dialer.Listen(ctx, network, address, dialer.WithOption(d.Opt))
+}
+func (h mihomoNetwork) LookupIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	switch network {
+	case "ip4":
+		return resolver.LookupIPv4WithResolver(ctx, host, resolver.ProxyServerHostResolver)
+	case "ip6":
+		return resolver.LookupIPv6WithResolver(ctx, host, resolver.ProxyServerHostResolver)
+	default:
+		return resolver.LookupIPWithResolver(ctx, host, resolver.ProxyServerHostResolver)
+	}
+}
+
+var _ et.HostNetwork = mihomoNetwork{}
+
+type EasyTierNativeOption struct {
+	BasicOption
+	Name          string   `proxy:"name"`
+	NetworkName   string   `proxy:"network-name"`
+	NetworkSecret string   `proxy:"network-secret,omitempty"`
+	Hostname      string   `proxy:"hostname,omitempty"`
+	IPv4          string   `proxy:"ipv4,omitempty"`
+	DHCP          bool     `proxy:"dhcp,omitempty"`
+	DHCPSubnet    string   `proxy:"dhcp-subnet,omitempty"`
+	Peers         []string `proxy:"peers,omitempty"`
+	Listeners     []string `proxy:"listeners,omitempty"`
+	UDPListen     string   `proxy:"udp-listen,omitempty"`
+	STUN          string   `proxy:"stun,omitempty"`
+	Punch         bool     `proxy:"punch,omitempty"`
+	NAT           string   `proxy:"nat,omitempty"`
+	Secure        bool     `proxy:"secure-mode,omitempty"`
+	PrivateKey    string   `proxy:"private-key,omitempty"`
+}
+type EasyTierNative struct {
+	*Base
+	server      *et.Server
+	unregister  func()
+	closeOnce   sync.Once
+	dialerProxy string
+}
+
+var _ ProxyAdapter = (*EasyTierNative)(nil)
+
+func NewEasyTierNative(o EasyTierNativeOption) (*EasyTierNative, error) {
+	b := NewBase(BaseOption{Name: o.Name, Addr: o.NetworkName, Type: C.EasyTier, UDP: true, Interface: o.Interface, RoutingMark: o.RoutingMark, Prefer: o.IPVersion, ProviderName: o.ProviderName})
+	b.dialer = o.NewDialer(b.DialOptions())
+	c := et.Config{NetworkName: o.NetworkName, NetworkSecret: o.NetworkSecret, Hostname: o.Hostname, DHCP: o.DHCP, Peers: o.Peers, Listeners: o.Listeners, UDP: et.UDPConfig{Listen: o.UDPListen, STUN: o.STUN, Punch: o.Punch, NAT: o.NAT}, HostNetwork: mihomoNetwork{b.dialer}, Logf: log.Debugln}
+	var err error
+	if o.IPv4 != "" {
+		c.IPv4, err = netip.ParsePrefix(o.IPv4)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if o.DHCPSubnet != "" {
+		c.DHCPSubnet, err = netip.ParsePrefix(o.DHCPSubnet)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if o.Secure {
+		c.Encryption = et.Noise
+	}
+	if o.PrivateKey != "" {
+		c.PrivateKey, err = base64.StdEncoding.DecodeString(o.PrivateKey)
+		if err != nil {
+			return nil, err
+		}
+	}
+	s, err := et.New(c)
+	if err != nil {
+		return nil, err
+	}
+	e := &EasyTierNative{Base: b, server: s, dialerProxy: o.DialerProxy}
+	if err = s.Start(); err != nil {
+		s.Close()
+		return nil, err
+	}
+	e.unregister = dns.RegisterEasyTierDnsClient(o.Name, nativeEasyTierDNS{e})
+	return e, nil
+}
+func (e *EasyTierNative) DialContext(ctx context.Context, m *C.Metadata) (C.Conn, error) {
+	c, err := e.server.Dial(ctx, "tcp", m.RemoteAddress())
+	if err != nil {
+		return nil, err
+	}
+	return NewConn(c, e), nil
+}
+func (e *EasyTierNative) ResolveUDP(ctx context.Context, m *C.Metadata) error {
+	if err := e.server.Up(ctx); err != nil {
+		return err
+	}
+	if m.Host != "" {
+		ips, err := e.server.LookupHost(ctx, m.Host)
+		if err != nil {
+			return err
+		}
+		m.DstIP = ips[0]
+	}
+	if !m.DstIP.Is4() {
+		return errors.New("easytier-native: IPv4 destination required")
+	}
+	return nil
+}
+func (e *EasyTierNative) ListenPacketContext(ctx context.Context, m *C.Metadata) (C.PacketConn, error) {
+	if err := e.ResolveUDP(ctx, m); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	p, err := e.server.ListenPacket("udp", ":0")
+	if err != nil {
+		return nil, err
+	}
+	return NewPacketConn(p, e), nil
+}
+func (e *EasyTierNative) Close() error {
+	e.closeOnce.Do(func() {
+		if e.unregister != nil {
+			e.unregister()
+		}
+		e.server.Close()
+	})
+	return nil
+}
+func (e *EasyTierNative) ProxyInfo() (info C.ProxyInfo) {
+	info = e.Base.ProxyInfo()
+	info.DialerProxy = e.dialerProxy
+	return
+}
+
+type nativeEasyTierDNS struct{ outbound *EasyTierNative }
+
+func (t nativeEasyTierDNS) Address() string  { return "easytier://" + t.outbound.Name() }
+func (t nativeEasyTierDNS) ResetConnection() {}
+func (t nativeEasyTierDNS) ExchangeContext(ctx context.Context, q *D.Msg) (*D.Msg, error) {
+	if len(q.Question) != 1 {
+		return nil, fmt.Errorf("one DNS question required")
+	}
+	if err := t.outbound.server.Up(ctx); err != nil {
+		return nil, err
+	}
+	reply := new(D.Msg)
+	reply.SetReply(q)
+	reply.Authoritative = true
+	ips, err := t.outbound.server.LookupHost(ctx, q.Question[0].Name)
+	if errors.Is(err, et.ErrNameNotFound) {
+		reply.Rcode = D.RcodeNameError
+		return reply, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if q.Question[0].Qtype == D.TypeA {
+		for _, ip := range ips {
+			reply.Answer = append(reply.Answer, &D.A{Hdr: D.RR_Header{Name: q.Question[0].Name, Rrtype: D.TypeA, Class: D.ClassINET, Ttl: 60}, A: ip.AsSlice()})
+		}
+	}
+	return reply, nil
+}

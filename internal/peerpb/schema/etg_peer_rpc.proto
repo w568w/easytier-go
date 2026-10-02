@@ -1,0 +1,156 @@
+syntax = "proto3";
+package easytier_go.peer_rpc;
+option go_package = "github.com/easytier/easytier-go/internal/peerpb";
+import "etg_common.proto";
+import "google/protobuf/timestamp.proto";
+message HandshakeRequest{
+  uint32 magic = 1;
+  uint32 my_peer_id = 2;
+  uint32 version = 3;
+  string network_name = 5;
+  bytes network_secret_digest = 6;
+}
+enum PeerConnSessionActionPb{
+  Join = 0;
+  Sync = 1;
+  Create = 2;
+}
+message PeerConnNoiseMsg1Pb{
+  uint32 version = 1;
+  string a_network_name = 2;
+  optional uint32 a_session_generation = 3;
+  easytier_go.common.UUID a_conn_id = 4;
+  string client_encryption_algorithm = 5;
+}
+message PeerConnNoiseMsg2Pb{
+  string b_network_name = 1;
+  uint32 role_hint = 2;
+  PeerConnSessionActionPb action = 3;
+  uint32 b_session_generation = 4;
+  optional bytes root_key_32 = 5;
+  uint32 initial_epoch = 6;
+  easytier_go.common.UUID b_conn_id = 7;
+  easytier_go.common.UUID a_conn_id_echo = 8;
+  optional bytes secret_proof_32 = 9;
+  string server_encryption_algorithm = 10;
+}
+message PeerConnNoiseMsg3Pb{
+  easytier_go.common.UUID a_conn_id_echo = 1;
+  easytier_go.common.UUID b_conn_id_echo = 2;
+  optional bytes secret_proof_32 = 3;
+  bytes secret_digest = 4;
+}
+message RelayNoiseMsg1Pb{
+  uint32 version = 1;
+  optional uint32 a_session_generation = 3;
+  easytier_go.common.UUID a_conn_id = 4;
+  string client_encryption_algorithm = 5;
+}
+message RelayNoiseMsg2Pb{
+  PeerConnSessionActionPb action = 3;
+  uint32 b_session_generation = 4;
+  optional bytes root_key_32 = 5;
+  uint32 initial_epoch = 6;
+  easytier_go.common.UUID b_conn_id = 7;
+  easytier_go.common.UUID a_conn_id_echo = 8;
+  string server_encryption_algorithm = 10;
+}
+message RoutePeerInfo{
+  uint32 peer_id = 1;
+  easytier_go.common.UUID inst_id = 2;
+  uint32 cost = 3;
+  optional easytier_go.common.Ipv4Addr ipv4_addr = 4;
+  optional string hostname = 6;
+  easytier_go.common.NatType udp_nat_type = 7;
+  google.protobuf.Timestamp last_update = 8;
+  repeated string proxy_cidrs = 5;
+  uint32 version = 9;
+  string easytier_version = 10;
+  easytier_go.common.PeerFeatureFlag feature_flag = 11;
+  uint64 peer_route_id = 12;
+  uint32 network_length = 13;
+  bytes noise_static_pubkey = 18;
+}
+message PeerIdVersion{
+  uint32 peer_id = 1;
+  uint32 version = 2;
+}
+message RouteConnBitmap{
+  repeated PeerIdVersion peer_ids = 1;
+  bytes bitmap = 2;
+}
+message RouteConnPeerList{
+  message PeerConnInfo{
+    PeerIdVersion peer_id = 1;
+    repeated uint32 connected_peer_ids = 2;
+  }
+  repeated PeerConnInfo peer_conn_infos = 1;
+}
+message RoutePeerInfos{
+  repeated RoutePeerInfo items = 1;
+}
+message SyncRouteInfoRequest{
+  uint32 my_peer_id = 1;
+  uint64 my_session_id = 2;
+  bool is_initiator = 3;
+  RoutePeerInfos peer_infos = 4;
+  oneof conn_info{
+    RouteConnBitmap conn_bitmap = 5;
+    RouteConnPeerList conn_peer_list = 7;
+  }
+}
+enum SyncRouteInfoError{
+  DuplicatePeerId = 0;
+  Stopped = 1;
+}
+message SyncRouteInfoResponse{
+  bool is_initiator = 1;
+  uint64 session_id = 2;
+  optional SyncRouteInfoError error = 3;
+  repeated uint32 missing_peer_ids = 4;
+  repeated uint32 missing_conn_peer_ids = 5;
+}
+message SelectPunchListenerRequest{
+  bool force_new = 1;
+  bool prefer_port_mapping = 2;
+}
+message SelectPunchListenerResponse{
+  easytier_go.common.SocketAddr listener_mapped_addr = 1;
+}
+message SendPunchPacketConeRequest{
+  easytier_go.common.SocketAddr listener_mapped_addr = 1;
+  easytier_go.common.SocketAddr dest_addr = 2;
+  uint32 transaction_id = 3;
+  uint32 packet_count_per_batch = 4;
+  uint32 packet_batch_count = 5;
+  uint32 packet_interval_ms = 6;
+}
+message SendPunchPacketHardSymRequest{
+  easytier_go.common.SocketAddr listener_mapped_addr = 1;
+  repeated easytier_go.common.Ipv4Addr public_ips = 2;
+  uint32 transaction_id = 3;
+  uint32 port_index = 4;
+  uint32 round = 5;
+}
+message SendPunchPacketHardSymResponse{
+  uint32 next_port_index = 1;
+}
+message SendPunchPacketEasySymRequest{
+  easytier_go.common.SocketAddr listener_mapped_addr = 1;
+  repeated easytier_go.common.Ipv4Addr public_ips = 2;
+  uint32 transaction_id = 3;
+  uint32 base_port_num = 4;
+  uint32 max_port_num = 5;
+  bool is_incremental = 6;
+}
+message SendPunchPacketBothEasySymRequest{
+  uint32 udp_socket_count = 1;
+  easytier_go.common.Ipv4Addr public_ip = 2;
+  uint32 transaction_id = 3;
+  uint32 dst_port_num = 4;
+  uint32 wait_time_ms = 5;
+}
+message SendPunchPacketBothEasySymResponse{
+  bool is_busy = 1;
+  easytier_go.common.SocketAddr base_mapped_addr = 2;
+}
